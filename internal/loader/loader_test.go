@@ -2,6 +2,7 @@ package loader
 
 import (
 	"context"
+	"go/build"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,29 @@ import (
 	"strings"
 	"testing"
 )
+
+// Check the files selected by the compiler, including unused package helpers.
+func TestVortexLoaderNoRedisImport(t *testing.T) {
+	pkg, err := build.ImportDir(".", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range pkg.Imports {
+		if strings.HasPrefix(path, "github.com/go-redis/redis/") || strings.HasPrefix(path, "github.com/redis/go-redis/") {
+			t.Errorf("forbidden Redis backend remains in compiled loader package: %s", path)
+		}
+	}
+}
+
+func TestHTTPLoader_NilOption(t *testing.T) {
+	ld := HTTPLoader("http://localhost:1", HTTPLoaderOption(nil))
+	if ld == nil {
+		t.Fatal("nil HTTP loader")
+	}
+	if err := ld.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // --- FileLoader ---
 
