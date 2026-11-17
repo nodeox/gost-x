@@ -2,16 +2,14 @@ package net
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"syscall"
 
 	xio "github.com/go-gost/x/internal/io"
-	"github.com/vishvananda/netns"
 )
 
 func init() {
@@ -53,72 +51,27 @@ func IsIPv4(address string) bool {
 	return address != "" && address[0] != ':' && address[0] != '['
 }
 
-// ListenConfig extends net.ListenConfig with network namespace support.
+// ListenConfig retains the namespace field for compatibility but rejects nonempty values.
 type ListenConfig struct {
 	Netns string
 	net.ListenConfig
 }
 
-// Listen announces on the local network address, switching into the configured
-// network namespace first if one is set.
+// Listen rejects namespace switching before creating a listener.
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (net.Listener, error) {
 	if lc.Netns != "" {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		originNs, err := netns.Get()
-		if err != nil {
-			return nil, fmt.Errorf("netns.Get(): %v", err)
-		}
-		defer netns.Set(originNs)
-
-		var ns netns.NsHandle
-		if strings.HasPrefix(lc.Netns, "/") {
-			ns, err = netns.GetFromPath(lc.Netns)
-		} else {
-			ns, err = netns.GetFromName(lc.Netns)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("netns.Get(%s): %v", lc.Netns, err)
-		}
-		defer ns.Close()
-
-		if err := netns.Set(ns); err != nil {
-			return nil, fmt.Errorf("netns.Set(%s): %v", lc.Netns, err)
-		}
+		return nil, errors.ErrUnsupported
 	}
 
 	return lc.ListenConfig.Listen(ctx, network, address)
 }
 
-// ListenPacket announces on the local network address for packet connections,
-// switching into the configured network namespace first if one is set.
+// ListenPacket rejects namespace switching before creating a packet listener.
 func (lc *ListenConfig) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
 	if lc.Netns != "" {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		originNs, err := netns.Get()
-		if err != nil {
-			return nil, fmt.Errorf("netns.Get(): %v", err)
-		}
-		defer netns.Set(originNs)
-
-		var ns netns.NsHandle
-		if strings.HasPrefix(lc.Netns, "/") {
-			ns, err = netns.GetFromPath(lc.Netns)
-		} else {
-			ns, err = netns.GetFromName(lc.Netns)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("netns.Get(%s): %v", lc.Netns, err)
-		}
-		defer ns.Close()
-
-		if err := netns.Set(ns); err != nil {
-			return nil, fmt.Errorf("netns.Set(%s): %v", lc.Netns, err)
-		}
+		return nil, errors.ErrUnsupported
 	}
+
 	return lc.ListenConfig.ListenPacket(ctx, network, address)
 }
 
