@@ -2,47 +2,21 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
-	"path/filepath"
-	"reflect"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	yaml "github.com/goccy/go-yaml"
-	"github.com/mitchellh/mapstructure"
-	"github.com/spf13/viper"
 )
-
-var (
-	v = viper.GetViper()
-)
-
-func init() {
-	v.SetConfigName("gost")
-	v.AddConfigPath("/etc/gost/")
-	v.AddConfigPath("$HOME/.gost/")
-	v.AddConfigPath(".")
-}
 
 var (
 	global    = &Config{}
 	globalMux sync.RWMutex
-
-	// configFile remembers the last file loaded via ReadFile so the API can
-	// save back to the same location (issue go-gost/x#123).
-	configFile atomic.Value // string
 )
 
-// ConfigFile returns the path of the last config file loaded via ReadFile,
-// or an empty string when the config came from stdin, a URL, or inline JSON.
-func ConfigFile() string {
-	if s, ok := configFile.Load().(string); ok {
-		return s
-	}
-	return ""
-}
+// ConfigFile is empty because external configuration loading is disabled.
+func ConfigFile() string { return "" }
 
 func Global() *Config {
 	globalMux.RLock()
@@ -712,30 +686,6 @@ type ChainGroupEntry struct {
 	Probe   *ProbeConfig       `yaml:",omitempty" json:"probe,omitempty"`
 }
 
-// gostDecodeHook is a composite mapstructure decode hook that handles custom
-// type conversions needed by GOST config fields. viper's internal unmarshalling
-// never calls yaml.Unmarshaler / json.Unmarshaler on leaf types, so the hook is
-// the only way to support these.
-func gostDecodeHook() mapstructure.DecodeHookFunc {
-	return func(f, t reflect.Type, data any) (any, error) {
-		// Plain string → ChainGroupEntry: backward compat for "chains: [a, b]".
-		if t == reflect.TypeOf(ChainGroupEntry{}) {
-			if s, ok := data.(string); ok {
-				return ChainGroupEntry{Chain: s}, nil
-			}
-			return data, nil
-		}
-		// String → time.Duration: accept "10s", "1m", etc. in YAML/JSON.
-		if t == reflect.TypeOf(time.Duration(0)) {
-			if s, ok := data.(string); ok {
-				return time.ParseDuration(s)
-			}
-			return data, nil
-		}
-		return data, nil
-	}
-}
-
 type ChainGroupConfig struct {
 	Chains   []*ChainGroupEntry `yaml:",omitempty" json:"chains,omitempty"`
 	Selector *SelectorConfig    `yaml:",omitempty" json:"selector,omitempty"`
@@ -817,46 +767,33 @@ type Config struct {
 	Dashboard  *DashboardConfig   `yaml:",omitempty" json:"dashboard,omitempty"`
 }
 
-func (c *Config) Load() error {
-	if err := v.ReadInConfig(); err != nil {
-		return err
-	}
+// Load rejects external configuration discovery.
+func (c *Config) Load() error { return errors.ErrUnsupported }
 
-	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
-}
+// Read rejects GOST configuration input without consuming the reader.
+func (c *Config) Read(r io.Reader, configType string) error { return errors.ErrUnsupported }
 
-func (c *Config) Read(r io.Reader, configType string) error {
-	v.SetConfigType(configType)
-	if err := v.ReadConfig(r); err != nil {
-		return err
-	}
+// ReadFile rejects external configuration files without opening them.
+func (c *Config) ReadFile(file string) error { return errors.ErrUnsupported }
 
-	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
-}
-
-func (c *Config) ReadFile(file string) error {
-	v.SetConfigFile(file)
-	v.SetConfigType(strings.TrimPrefix(filepath.Ext(file), ".")) // force format from extension
-	if err := v.ReadInConfig(); err != nil {
-		return err
-	}
-	configFile.Store(file)
-	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
-}
-
+// Write serializes an explicitly supplied typed configuration.
 func (c *Config) Write(w io.Writer, format string) error {
 	switch format {
 	case "json":
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		enc.Encode(c)
-		return nil
-	case "yaml":
-		fallthrough
-	default:
-		enc := yaml.NewEncoder(w, yaml.Indent(2))
-		defer enc.Close()
-
 		return enc.Encode(c)
+	case "yaml":
+		data, err := yaml.MarshalWithOptions(c, yaml.Indent(2))
+		if err != nil {
+			return err
+		}
+		n, err := w.Write(data)
+		if err == nil && n != len(data) {
+			return io.ErrShortWrite
+		}
+		return err
+	default:
+		return errors.ErrUnsupported
 	}
 }

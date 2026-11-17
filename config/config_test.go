@@ -105,6 +105,7 @@ func TestVortexConfigExternalLoadRejected(t *testing.T) {
 
 func TestVortexConfigTypedStaticRoundTrip(t *testing.T) {
 	c := Config{TLS: &TLSConfig{Secure: true, ServerName: "relay.example", Options: &TLSOptions{MinVersion: "VersionTLS13", ALPN: []string{"vortex"}}}, Nodes: []*NodeConfig{{Name: "exit", Addr: "127.0.0.1:443", TLS: &TLSNodeConfig{Secure: true, ServerName: "exit.example"}}}, Hops: []*HopConfig{{Name: "path", Selector: &SelectorConfig{Strategy: "parallel", MaxFails: 3, FailTimeout: 15 * time.Second, MaxParallel: 4, ParallelMode: "random"}}}}
+	c.Services = []*ServiceConfig{{Name: "entry", Addr: "127.0.0.1:10000", Listener: &ListenerConfig{Type: "tcp"}, Handler: &HandlerConfig{Type: "relay"}}}
 	for _, format := range []string{"json", "yaml"} {
 		t.Run(format, func(t *testing.T) {
 			var buf bytes.Buffer
