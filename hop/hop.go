@@ -1,14 +1,9 @@
-// Package hop provides a hop (node group) implementation that selects a node
-// from a group of proxy nodes using load-balancing strategies, filters, and
-// bypass rules. It supports periodic reloading of node lists from file, Redis,
-// or HTTP sources.
+// Package hop provides a typed node group implementation with load-balancing
+// strategies, filters, and bypass rules.
 package hop
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"io"
 	"sort"
 	"sync"
 	"time"
@@ -19,9 +14,6 @@ import (
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/routing"
 	"github.com/go-gost/core/selector"
-	"github.com/go-gost/x/config"
-	node_parser "github.com/go-gost/x/config/parsing/node"
-	"github.com/go-gost/x/internal/loader"
 	xlogger "github.com/go-gost/x/logger"
 	mdutil "github.com/go-gost/x/metadata/util"
 	xs "github.com/go-gost/x/selector"
@@ -38,14 +30,7 @@ type options struct {
 	// node, so the marker is checked here instead).
 	failMaxFails int
 	failTimeout  time.Duration
-	fileLoader   loader.Loader
-	redisLoader  loader.Loader
-	httpLoader   loader.Loader
-	period       time.Duration
 	logger       logger.Logger
-	// nodeDefaults are hop-level settings (resolver, hosts, interface, etc.)
-	// inherited by nodes loaded at runtime from file, Redis, or HTTP sources.
-	nodeDefaults node_parser.HopDefaults
 }
 
 // Option configures a hop.
@@ -89,44 +74,6 @@ func FailFilterSettingsOption(maxFails int, timeout time.Duration) Option {
 	}
 }
 
-// ReloadPeriodOption sets the interval for periodic reloading of node lists.
-func ReloadPeriodOption(period time.Duration) Option {
-	return func(opts *options) {
-		opts.period = period
-	}
-}
-
-// FileLoaderOption sets a loader that reads node configs from a file source.
-func FileLoaderOption(fileLoader loader.Loader) Option {
-	return func(opts *options) {
-		opts.fileLoader = fileLoader
-	}
-}
-
-// RedisLoaderOption sets a loader that reads node configs from a Redis source.
-func RedisLoaderOption(redisLoader loader.Loader) Option {
-	return func(opts *options) {
-		opts.redisLoader = redisLoader
-	}
-}
-
-// HTTPLoaderOption sets a loader that reads node configs from an HTTP source.
-func HTTPLoaderOption(httpLoader loader.Loader) Option {
-	return func(opts *options) {
-		opts.httpLoader = httpLoader
-	}
-}
-
-// NodeDefaultsOption sets the hop-level values (resolver, hosts, interface,
-// so_mark, proxy protocol, netns) inherited by nodes loaded at runtime from
-// file, Redis, or HTTP sources. Inline nodes receive these at parse time;
-// this option makes the same values available to runtime-loaded nodes.
-func NodeDefaultsOption(defaults node_parser.HopDefaults) Option {
-	return func(opts *options) {
-		opts.nodeDefaults = defaults
-	}
-}
-
 // LoggerOption sets the logger for the hop.
 func LoggerOption(logger logger.Logger) Option {
 	return func(opts *options) {
@@ -135,14 +82,13 @@ func LoggerOption(logger logger.Logger) Option {
 }
 
 type chainHop struct {
-	nodes      []*chain.Node
-	options    options
-	logger     logger.Logger
-	mu         sync.RWMutex
-	cancelFunc context.CancelFunc
+	nodes   []*chain.Node
+	options options
+	logger  logger.Logger
+	mu      sync.RWMutex
 }
 
-// NewHop creates a new hop with the given options and starts periodic reloading.
+// NewHop creates a hop from explicitly supplied typed nodes.
 func NewHop(opts ...Option) hop.Hop {
 	var options options
 	for _, opt := range opts {
@@ -151,20 +97,15 @@ func NewHop(opts ...Option) hop.Hop {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.TODO())
 	p := &chainHop{
-		nodes:      options.nodes,
-		cancelFunc: cancel,
-		options:    options,
-		logger:     options.logger,
+		nodes:   options.nodes,
+		options: options,
+		logger:  options.logger,
 	}
 
 	if p.logger == nil {
 		p.logger = xlogger.Nop()
 	}
-
-	go p.periodReload(ctx)
-
 	return p
 }
 
@@ -386,157 +327,11 @@ func (p *chainHop) nodeMatches(ctx context.Context, node *chain.Node, opts *hop.
 	return true
 }
 
-func (p *chainHop) periodReload(ctx context.Context) error {
-	if err := p.reload(ctx); err != nil {
-		p.logger.Warnf("reload: %v", err)
-	}
-
-	period := p.options.period
-	if period <= 0 {
-		return nil
-	}
-	if period < time.Second {
-		period = time.Second
-	}
-
-	ticker := time.NewTicker(period)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if err := p.reload(ctx); err != nil {
-				p.logger.Warnf("reload: %v", err)
-				// return err
-			}
-			p.logger.Debug("hop reload done")
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (p *chainHop) reload(ctx context.Context) (err error) {
-	nodes := p.options.nodes
-
-	nl, err := p.load(ctx)
-
-	nodes = append(nodes, nl...)
-
-	p.logger.Debugf("load items %d", len(nodes))
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.nodes = nodes
-
-	return
-}
-
-func (p *chainHop) load(ctx context.Context) (nodes []*chain.Node, err error) {
-	var errs []error
-
-	if loader := p.options.fileLoader; loader != nil {
-		r, er := loader.Load(ctx)
-		if er != nil {
-			p.logger.Warnf("file loader: %v", er)
-			errs = append(errs, er)
-		}
-		ns, pe := p.parseNode(r)
-		if pe != nil {
-			errs = append(errs, pe)
-		}
-		nodes = append(nodes, ns...)
-	}
-
-	if loader := p.options.redisLoader; loader != nil {
-		r, er := loader.Load(ctx)
-		if er != nil {
-			p.logger.Warnf("redis loader: %v", er)
-			errs = append(errs, er)
-		}
-		ns, pe := p.parseNode(r)
-		if pe != nil {
-			errs = append(errs, pe)
-		}
-		nodes = append(nodes, ns...)
-	}
-
-	if loader := p.options.httpLoader; loader != nil {
-		r, er := loader.Load(ctx)
-		if er != nil {
-			p.logger.Warnf("http loader: %v", er)
-			errs = append(errs, er)
-		}
-		ns, pe := p.parseNode(r)
-		if pe != nil {
-			errs = append(errs, pe)
-		}
-		nodes = append(nodes, ns...)
-	}
-
-	return nodes, errors.Join(errs...)
-}
-
-func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
-	if r == nil {
-		return nil, nil
-	}
-
-	var ncs []*config.NodeConfig
-	if err := json.NewDecoder(r).Decode(&ncs); err != nil {
-		return nil, err
-	}
-
-	var (
-		nodes []*chain.Node
-		errs  []error
-	)
-	for _, nc := range ncs {
-		if nc == nil {
-			continue
-		}
-
-		name := nc.Name
-		nc, err := node_parser.ResolveConfig(nc)
-		if err != nil {
-			// Warn and skip: file/Redis/HTTP reloads must stay resilient
-			// to a single bad entry. (Contrast with ParseHop, which
-			// fails the whole hop on a dangling reference at startup.)
-			p.logger.Warnf("skip node %s: %v", name, err)
-			errs = append(errs, err)
-			continue
-		}
-
-		// Loaded nodes inherit the same hop-level defaults as inline nodes.
-		nc = p.options.nodeDefaults.Apply(nc)
-
-		node, err := node_parser.ParseNode(p.options.name, nc, logger.Default())
-		if err != nil {
-			p.logger.Warnf("skip node %s: %v", nc.Name, err)
-			errs = append(errs, err)
-			continue
-		}
-		nodes = append(nodes, node)
-	}
-	return nodes, errors.Join(errs...)
-}
-
 func (p *chainHop) Close() error {
-	p.cancelFunc()
 	for _, n := range p.Nodes() {
 		if n != nil {
 			n.Close()
 		}
-	}
-	if p.options.fileLoader != nil {
-		p.options.fileLoader.Close()
-	}
-	if p.options.redisLoader != nil {
-		p.options.redisLoader.Close()
-	}
-	if p.options.httpLoader != nil {
-		p.options.httpLoader.Close()
 	}
 	return nil
 }
