@@ -1,13 +1,68 @@
 package net
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
+	"syscall"
 	"testing"
 
 	xio "github.com/go-gost/x/internal/io"
 )
+
+func TestVortexListenNamespaceRejected(t *testing.T) {
+	for _, ns := range []string{"vortex-absent-namespace", "/nonexistent/vortex-namespace"} {
+		for _, network := range []string{"tcp", "udp"} {
+			t.Run(ns+network, func(t *testing.T) {
+				controls := 0
+				lc := ListenConfig{Netns: ns, ListenConfig: net.ListenConfig{Control: func(string, string, syscall.RawConn) error {
+					controls++
+					return nil
+				}}}
+				var err error
+				if network == "tcp" {
+					conn, e := lc.Listen(context.Background(), network, "invalid address")
+					err = e
+					if conn != nil {
+						conn.Close()
+						t.Fatal("listener returned for namespace")
+					}
+				} else {
+					conn, e := lc.ListenPacket(context.Background(), network, "invalid address")
+					err = e
+					if conn != nil {
+						conn.Close()
+						t.Fatal("packet listener returned for namespace")
+					}
+				}
+				if !errors.Is(err, errors.ErrUnsupported) {
+					t.Errorf("namespace error = %v, want unsupported", err)
+				}
+				if controls != 0 {
+					t.Errorf("socket Control called %d times", controls)
+				}
+			})
+		}
+	}
+}
+
+func TestVortexListenEmptyNamespaceTCPUDP(t *testing.T) {
+	lc := ListenConfig{}
+	tcp, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	udp, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	if tcp.Addr() == nil || udp.LocalAddr() == nil {
+		t.Fatal("missing bound address")
+	}
+}
 
 func TestIsIPv4(t *testing.T) {
 	tests := []struct {
