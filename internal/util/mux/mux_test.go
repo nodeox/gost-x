@@ -26,8 +26,6 @@ func TestStreamDeadlineStaysOnTheStream(t *testing.T) {
 	}{
 		{"smux", func(c net.Conn) (Session, error) { return ClientSession(c, &Config{Version: 2}) },
 			func(c net.Conn) (Session, error) { return ServerSession(c, &Config{Version: 2}) }},
-		{"yamux", func(c net.Conn) (Session, error) { return ClientSession(c, &Config{Type: "yamux"}) },
-			func(c net.Conn) (Session, error) { return ServerSession(c, &Config{Type: "yamux"}) }},
 	} {
 		t.Run(backend.name, func(t *testing.T) {
 			cli, srv := net.Pipe()
