@@ -2,9 +2,11 @@ package mux
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -101,4 +103,111 @@ func TestStreamDeadlineStaysOnTheStream(t *testing.T) {
 			}
 		})
 	}
+}
+
+type vortexNoIOConn struct {
+	net.Conn
+	calls atomic.Int32
+}
+
+func (c *vortexNoIOConn) Read([]byte) (int, error)         { c.calls.Add(1); return 0, io.EOF }
+func (c *vortexNoIOConn) Write([]byte) (int, error)        { c.calls.Add(1); return 0, io.ErrClosedPipe }
+func (c *vortexNoIOConn) Close() error                     { c.calls.Add(1); return nil }
+func (c *vortexNoIOConn) SetDeadline(time.Time) error      { c.calls.Add(1); return nil }
+func (c *vortexNoIOConn) SetReadDeadline(time.Time) error  { c.calls.Add(1); return nil }
+func (c *vortexNoIOConn) SetWriteDeadline(time.Time) error { c.calls.Add(1); return nil }
+
+func TestVortexMuxUnsupportedBeforeIO(t *testing.T) {
+	for _, kind := range []string{"yamux", "unknown", "SMUX"} {
+		for _, constructor := range []struct {
+			name string
+			make func(net.Conn, *Config) (Session, error)
+		}{{"client", ClientSession}, {"server", ServerSession}} {
+			t.Run(kind+constructor.name, func(t *testing.T) {
+				conn := &vortexNoIOConn{}
+				session, err := constructor.make(conn, &Config{Type: kind})
+				if session != nil {
+					defer session.Close()
+				}
+				if session != nil || !errors.Is(err, errors.ErrUnsupported) {
+					t.Errorf("backend %q session=%v err=%v, want unsupported", kind, session != nil, err)
+				}
+				if conn.calls.Load() != 0 {
+					t.Errorf("rejected constructor touched connection %d times", conn.calls.Load())
+				}
+			})
+		}
+	}
+}
+
+func vortexMuxRoundTrip(t *testing.T, cfg *Config) {
+	t.Helper()
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	client, err := ClientSession(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := ServerSession(b, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	stream, err := client.GetConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	peer, err := server.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	stream.SetDeadline(time.Now().Add(3 * time.Second))
+	peer.SetDeadline(time.Now().Add(3 * time.Second))
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4)
+		_, e := io.ReadFull(peer, buf)
+		if e == nil && string(buf) != "ping" {
+			e = errors.New("request payload changed")
+		}
+		if e == nil {
+			_, e = peer.Write([]byte("pong"))
+		}
+		done <- e
+	}()
+	if _, err := stream.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(stream, buf); err != nil || string(buf) != "pong" {
+		t.Fatalf("reply %q: %v", buf, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !client.IsClosed() {
+		t.Fatal("closed session still open")
+	}
+	if next, err := client.GetConn(); err == nil || next != nil {
+		if next != nil {
+			next.Close()
+		}
+		t.Fatal("closed session opened stream")
+	}
+}
+
+func TestVortexMuxNilConfig(t *testing.T) { vortexMuxRoundTrip(t, nil) }
+func TestVortexMuxEmptyType(t *testing.T) { vortexMuxRoundTrip(t, &Config{}) }
+func TestVortexMuxExplicitSMUX(t *testing.T) {
+	vortexMuxRoundTrip(t, &Config{Type: "smux", Version: 1})
+}
+func TestVortexMuxSMUXVersion2(t *testing.T) {
+	vortexMuxRoundTrip(t, &Config{Type: "smux", Version: 2})
 }
