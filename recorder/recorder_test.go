@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,12 @@ import (
 	"github.com/go-gost/core/recorder"
 	xlogger "github.com/go-gost/x/logger"
 )
+
+func TestRedisRecorderBackendSourceRemoved(t *testing.T) {
+	if _, err := os.Stat("redis.go"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Redis recorder backend source must be removed, stat error = %v", err)
+	}
+}
 
 // --- Option tests ---
 
