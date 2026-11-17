@@ -2,9 +2,9 @@ package hop
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,12 +17,8 @@ import (
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/metadata"
 	"github.com/go-gost/core/routing"
-	"github.com/go-gost/x/config"
-	"github.com/go-gost/x/config/parsing"
-	node_parser "github.com/go-gost/x/config/parsing/node"
 	xlogger "github.com/go-gost/x/logger"
 	xmd "github.com/go-gost/x/metadata"
-	mdutil "github.com/go-gost/x/metadata/util"
 	"github.com/go-gost/x/registry"
 	xrouting "github.com/go-gost/x/routing"
 	xselector "github.com/go-gost/x/selector"
@@ -36,6 +32,22 @@ func mustMatcher(t *testing.T, rule string) routing.Matcher {
 		t.Fatalf("NewMatcher(%q): %v", rule, err)
 	}
 	return m
+}
+
+func TestHopDoesNotImportDynamicConfigSources(t *testing.T) {
+	source, err := os.ReadFile("hop.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"github.com/go-gost/x/config",
+		"github.com/go-gost/x/internal/loader",
+		"encoding/json",
+	} {
+		if strings.Contains(string(source), forbidden) {
+			t.Errorf("typed hop still depends on dynamic configuration source %q", forbidden)
+		}
+	}
 }
 
 // --- Mock types ---
@@ -82,25 +94,6 @@ func (m *requestCapturingMatcher) Match(req *routing.Request) bool {
 		*m.capture = req
 	}
 	return m.match
-}
-
-type testLoader struct {
-	loadFn  func(ctx context.Context) (io.Reader, error)
-	closeFn func() error
-}
-
-func (l *testLoader) Load(ctx context.Context) (io.Reader, error) {
-	if l.loadFn != nil {
-		return l.loadFn(ctx)
-	}
-	return nil, nil
-}
-
-func (l *testLoader) Close() error {
-	if l.closeFn != nil {
-		return l.closeFn()
-	}
-	return nil
 }
 
 type stubConnector struct{}
@@ -190,41 +183,6 @@ func TestSelectorOption(t *testing.T) {
 	SelectorOption(sel)(&o)
 	if o.selector != sel {
 		t.Error("selector not set correctly")
-	}
-}
-
-func TestReloadPeriodOption(t *testing.T) {
-	var o options
-	ReloadPeriodOption(5 * time.Second)(&o)
-	if o.period != 5*time.Second {
-		t.Errorf("expected period 5s, got %v", o.period)
-	}
-}
-
-func TestFileLoaderOption(t *testing.T) {
-	var o options
-	ld := &testLoader{}
-	FileLoaderOption(ld)(&o)
-	if o.fileLoader != ld {
-		t.Error("fileLoader not set correctly")
-	}
-}
-
-func TestRedisLoaderOption(t *testing.T) {
-	var o options
-	ld := &testLoader{}
-	RedisLoaderOption(ld)(&o)
-	if o.redisLoader != ld {
-		t.Error("redisLoader not set correctly")
-	}
-}
-
-func TestHTTPLoaderOption(t *testing.T) {
-	var o options
-	ld := &testLoader{}
-	HTTPLoaderOption(ld)(&o)
-	if o.httpLoader != ld {
-		t.Error("httpLoader not set correctly")
 	}
 }
 
@@ -883,229 +841,6 @@ func TestSelect_MatcherWithFullRequest(t *testing.T) {
 // reload tests
 // =============================================================================
 
-func TestReload_NoLoaders(t *testing.T) {
-	ch := &chainHop{
-		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}},
-		logger:  xlogger.Nop(),
-	}
-	err := ch.reload(context.Background())
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	nodes := ch.Nodes()
-	if len(nodes) != 1 {
-		t.Errorf("expected 1 node, got %d", len(nodes))
-	}
-}
-
-func TestReload_WithFileLoader(t *testing.T) {
-	loader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return strings.NewReader(`[{"name": "loaded", "addr": "10.0.0.1:8080"}]`), nil
-		},
-	}
-	ch := &chainHop{
-		logger:  xlogger.Nop(),
-		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, fileLoader: loader, name: "test-hop"},
-	}
-	err := ch.reload(context.Background())
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	nodes := ch.Nodes()
-	if len(nodes) < 2 {
-		t.Errorf("expected at least 2 nodes, got %d", len(nodes))
-	}
-}
-
-func TestReload_LoaderError(t *testing.T) {
-	loadErr := errors.New("load failed")
-	loader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return nil, loadErr
-		},
-	}
-	ch := &chainHop{
-		logger:  xlogger.Nop(),
-		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, fileLoader: loader},
-	}
-	err := ch.reload(context.Background())
-	if err == nil {
-		t.Error("expected error from failed loader")
-	}
-}
-
-func TestReload_RedisLoader(t *testing.T) {
-	loader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return strings.NewReader(`[{"name": "redis-node", "addr": "10.0.0.2:8080"}]`), nil
-		},
-	}
-	ch := &chainHop{
-		logger:  xlogger.Nop(),
-		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, redisLoader: loader, name: "test-hop"},
-	}
-	err := ch.reload(context.Background())
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestReload_HTTPLoader(t *testing.T) {
-	loader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return strings.NewReader(`[{"name": "http-node", "addr": "10.0.0.3:8080"}]`), nil
-		},
-	}
-	ch := &chainHop{
-		logger:  xlogger.Nop(),
-		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, httpLoader: loader, name: "test-hop"},
-	}
-	err := ch.reload(context.Background())
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestReload_MultipleLoaders(t *testing.T) {
-	fileLoader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return strings.NewReader(`[{"name": "file-n", "addr": "10.0.0.1:8080"}]`), nil
-		},
-	}
-	redisLoader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return strings.NewReader(`[{"name": "redis-n", "addr": "10.0.0.2:8080"}]`), nil
-		},
-	}
-	ch := &chainHop{
-		logger: xlogger.Nop(),
-		options: options{
-			nodes:       []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
-			fileLoader:  fileLoader,
-			redisLoader: redisLoader,
-			name:        "test-hop",
-		},
-	}
-	err := ch.reload(context.Background())
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestReload_LoaderErrorWithParseError(t *testing.T) {
-	loader := &testLoader{
-		loadFn: func(ctx context.Context) (io.Reader, error) {
-			return strings.NewReader(`invalid json`), nil
-		},
-	}
-	ch := &chainHop{
-		logger:  xlogger.Nop(),
-		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, fileLoader: loader},
-	}
-	err := ch.reload(context.Background())
-	if err == nil {
-		t.Error("expected parse error")
-	}
-}
-
-// =============================================================================
-// parseNode tests
-// =============================================================================
-
-func TestParseNode_NilReader(t *testing.T) {
-	ch := &chainHop{logger: xlogger.Nop()}
-	nodes, err := ch.parseNode(nil)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if len(nodes) != 0 {
-		t.Errorf("expected 0 nodes, got %d", len(nodes))
-	}
-}
-
-func TestParseNode_ValidJSON(t *testing.T) {
-	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
-	r := strings.NewReader(`[{"name": "n1", "addr": "10.0.0.1:8080"}]`)
-	nodes, err := ch.parseNode(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(nodes) != 1 {
-		t.Fatalf("expected 1 node, got %d", len(nodes))
-	}
-	if nodes[0].Name != "n1" {
-		t.Errorf("expected 'n1', got %q", nodes[0].Name)
-	}
-}
-
-func TestParseNode_GlobalReference(t *testing.T) {
-	const name = "reloaded-global-node"
-	registry.NodeRegistry().Register(name, &config.NodeConfig{
-		Name: name,
-		Addr: "10.0.0.2:8080",
-	})
-	t.Cleanup(func() { registry.NodeRegistry().Unregister(name) })
-
-	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
-	nodes, err := ch.parseNode(strings.NewReader(`[{"name":"reloaded-global-node"}]`))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(nodes) != 1 || nodes[0].Name != name || nodes[0].Addr != "10.0.0.2:8080" {
-		t.Fatalf("unexpected nodes: %+v", nodes)
-	}
-}
-
-func TestParseNode_EmptyArray(t *testing.T) {
-	ch := &chainHop{logger: xlogger.Nop()}
-	r := strings.NewReader(`[]`)
-	nodes, err := ch.parseNode(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(nodes) != 0 {
-		t.Errorf("expected 0 nodes, got %d", len(nodes))
-	}
-}
-
-func TestParseNode_InvalidJSON(t *testing.T) {
-	ch := &chainHop{logger: xlogger.Nop()}
-	r := strings.NewReader(`not json`)
-	nodes, err := ch.parseNode(r)
-	if err == nil {
-		t.Error("expected error for invalid JSON")
-	}
-	if len(nodes) != 0 {
-		t.Errorf("expected 0 nodes, got %d", len(nodes))
-	}
-}
-
-func TestParseNode_NilEntrySkipped(t *testing.T) {
-	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
-	r := strings.NewReader(`[null, {"name": "ok", "addr": "10.0.0.1:8080"}]`)
-	nodes, err := ch.parseNode(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(nodes) != 1 {
-		t.Fatalf("expected 1 node, got %d", len(nodes))
-	}
-	if nodes[0].Name != "ok" {
-		t.Errorf("expected 'ok', got %q", nodes[0].Name)
-	}
-}
-
-func TestParseNode_SkipInvalidEntry(t *testing.T) {
-	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
-	r := strings.NewReader(`[{"name": "bad"}]`)
-	nodes, err := ch.parseNode(r)
-	// May return an error via errors.Join even if some nodes parsed
-	_ = err
-	_ = nodes
-}
-
-// =============================================================================
 // Close tests
 // =============================================================================
 
@@ -1117,93 +852,6 @@ func TestClose_NoLoaders(t *testing.T) {
 	}
 }
 
-func TestClose_WithLoaders(t *testing.T) {
-	fileClosed := false
-	redisClosed := false
-	httpClosed := false
-
-	h := newTestHop(
-		FileLoaderOption(&testLoader{closeFn: func() error { fileClosed = true; return nil }}),
-		RedisLoaderOption(&testLoader{closeFn: func() error { redisClosed = true; return nil }}),
-		HTTPLoaderOption(&testLoader{closeFn: func() error { httpClosed = true; return nil }}),
-	)
-	err := h.Close()
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if !fileClosed {
-		t.Error("fileLoader not closed")
-	}
-	if !redisClosed {
-		t.Error("redisLoader not closed")
-	}
-	if !httpClosed {
-		t.Error("httpLoader not closed")
-	}
-}
-
-func TestClose_CancelFuncCalled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := &chainHop{
-		cancelFunc: cancel,
-		logger:     xlogger.Nop(),
-	}
-	ch.Close()
-	select {
-	case <-ctx.Done():
-		// expected
-	default:
-		t.Error("context should be cancelled after Close")
-	}
-}
-
-// =============================================================================
-// periodReload tests
-// =============================================================================
-
-func TestPeriodReload_NoPeriod(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ch := &chainHop{
-		options: options{period: 0},
-		logger:  xlogger.Nop(),
-		nodes:   []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
-	}
-	err := ch.periodReload(ctx)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestPeriodReload_CancelledContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	ch := &chainHop{
-		options: options{period: time.Second},
-		logger:  xlogger.Nop(),
-		nodes:   []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
-	}
-	err := ch.periodReload(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-}
-
-func TestPeriodReload_MinimumPeriod(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := &chainHop{
-		options: options{period: time.Millisecond},
-		logger:  xlogger.Nop(),
-		nodes:   []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
-	}
-	time.AfterFunc(50*time.Millisecond, cancel)
-	err := ch.periodReload(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-}
-
-// =============================================================================
 // Priority edge cases
 // =============================================================================
 
@@ -1321,64 +969,3 @@ func TestNewHop_ReturnsHopInterface(t *testing.T) {
 }
 
 // =============================================================================
-// NewHop starts periodReload goroutine
-// =============================================================================
-
-func TestNewHop_StartsPeriodReload(t *testing.T) {
-	h := NewHop()
-	ch := h.(*chainHop)
-	if ch.cancelFunc == nil {
-		t.Error("expected non-nil cancelFunc")
-	}
-	h.(*chainHop).Close()
-}
-
-// TestParseNode_InheritsHopDefaults verifies that nodes loaded at runtime from
-// file/Redis/HTTP sources inherit the hop-level resolver, hosts mapper, and
-// connection metadata, matching the behavior of inline hop nodes.
-func TestParseNode_InheritsHopDefaults(t *testing.T) {
-	ch := &chainHop{
-		logger: xlogger.Nop(),
-		options: options{
-			name: "test-hop",
-			nodeDefaults: node_parser.HopDefaults{
-				Resolver:      "hop-resolver",
-				Hosts:         "hop-hosts",
-				Interface:     "eth9",
-				SoMark:        4321,
-				ProxyProtocol: 2,
-				Netns:         "testns",
-			},
-		},
-	}
-
-	nodes, err := ch.parseNode(strings.NewReader(`[{"name":"loaded","addr":"node.example:8080"}]`))
-	if err != nil {
-		t.Fatalf("parseNode: %v", err)
-	}
-	if len(nodes) != 1 {
-		t.Fatalf("expected 1 node, got %d", len(nodes))
-	}
-
-	opts := nodes[0].Options()
-	if opts.HostMapper == nil {
-		t.Error("loaded node did not inherit the hop hosts mapper")
-	}
-	if opts.Resolver == nil {
-		t.Error("loaded node did not inherit the hop resolver")
-	}
-
-	md := nodes[0].Metadata()
-	if got := mdutil.GetString(md, parsing.MDKeyInterface); got != "eth9" {
-		t.Errorf("interface = %q, want eth9", got)
-	}
-	if got := mdutil.GetInt(md, parsing.MDKeySoMark); got != 4321 {
-		t.Errorf("so_mark = %d, want 4321", got)
-	}
-	if got := mdutil.GetInt(md, parsing.MDKeyProxyProtocol); got != 2 {
-		t.Errorf("proxyProtocol = %d, want 2", got)
-	}
-	if got := mdutil.GetString(md, parsing.MDKeyNetns); got != "testns" {
-		t.Errorf("netns = %q, want testns", got)
-	}
-}
