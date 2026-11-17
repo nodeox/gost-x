@@ -6,7 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io"
+	"fmt"
 	"net"
 	"time"
 
@@ -19,7 +19,6 @@ import (
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
-	serial "github.com/go-gost/x/internal/util/serial"
 	"github.com/go-gost/x/internal/util/sniffing"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
@@ -34,26 +33,22 @@ import (
 // Data flow:
 //
 //	handleConnect()
-//	├─ 1. Clean address (unix/serial special handling)
-//	├─ 2. Wrap traffic limiter + stats
-//	├─ 3. Check target address is non-empty
-//	├─ 4. Bypass check
-//	├─ 5. Set consistent-hashing source (e.g. "host")
-//	├─ 6. Dial by network type:
-//	│   ├─ "unix"   → net.Dialer.DialContext("unix")
-//	│   ├─ "serial" → serial.OpenPort()
-//	│   └─ other    → h.options.Router.Dial()  ← chain routing
-//	├─ 7. Send response header (noDelay controls timing)
+//	├─ 1. Wrap traffic limiter + stats
+//	├─ 2. Check target address and supported network
+//	├─ 3. Bypass check
+//	├─ 4. Set consistent-hashing source (e.g. "host")
+//	├─ 5. Dial TCP/UDP through h.options.Router
+//	├─ 6. Send response header (noDelay controls timing)
 //	│   ├─ noDelay=true  → write relay.Response immediately
 //	│   └─ noDelay=false → buffer in wbuf, merged with first data packet
-//	├─ 8. Wrap connection by network type:
+//	├─ 7. Wrap connection by network type:
 //	│   ├─ UDP → udpConn (2-byte length prefix)
 //	│   └─ TCP → tcpConn (passthrough)
-//	├─ 9. Optional protocol sniffing:
+//	├─ 8. Optional protocol sniffing:
 //	│   ├─ HTTP → sniffer.HandleHTTP()
 //	│   ├─ TLS  → sniffer.HandleTLS()
-//	│   └─ other → continue to step 10
-//	└─ 10. xnet.Pipe() bidir copy (client ↔ target)
+//	│   └─ other → continue to step 9
+//	└─ 9. xnet.Pipe() bidir copy (client ↔ target)
 //
 // Key design decisions:
 //   - noDelay: low-latency mode sends each write as an independent relay frame.
@@ -62,12 +57,6 @@ import (
 //     HTTP/TLS traffic can be MITM-decrypted or recorded.
 //   - Route info (node chain) is recorded via ictx.ContextWithBuffer into ro.Route.
 func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network, address string, ro *xrecorder.HandlerRecorderObject, log logger.Logger) (err error) {
-	if network == "unix" || network == "serial" {
-		if host, _, _ := net.SplitHostPort(address); host != "" {
-			address = host
-		}
-	}
-
 	log = log.WithFields(map[string]any{
 		"dst":  address,
 		"cmd":  "connect",
@@ -115,6 +104,18 @@ func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network
 		return
 	}
 
+	switch network {
+	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
+	default:
+		resp.Status = relay.StatusBadRequest
+		unsupportedErr := fmt.Errorf("unsupported network %q", network)
+		if _, writeErr := resp.WriteTo(conn); writeErr != nil {
+			return errors.Join(unsupportedErr, writeErr)
+		}
+		log.Error(unsupportedErr)
+		return unsupportedErr
+	}
+
 	// Bypass check — if the target is in the bypass list, return Forbidden
 	if h.options.Bypass != nil && h.options.Bypass.Contains(ctx, network, address, bypass.WithService(h.options.Service)) {
 		log.Debug("bypass: ", address)
@@ -130,25 +131,13 @@ func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network
 	}
 
 	// --- Dial to target ---
-	var cc net.Conn
-	switch network {
-	case "unix":
-		cc, err = (&net.Dialer{}).DialContext(ctx, "unix", address)
-	case "serial":
-		var port io.ReadWriteCloser
-		port, err = serial.OpenPort(serial.ParseConfigFromAddr(address))
-		if err == nil {
-			cc = &serialConn{
-				ReadWriteCloser: port,
-				port:            address,
-			}
-		}
-	default:
-		var buf bytes.Buffer
-		cc, err = h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), network, address)
-		ro.Route = buf.String()
-	}
+	var buf bytes.Buffer
+	cc, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), network, address)
+	ro.Route = buf.String()
 	if err != nil {
+		if cc != nil {
+			_ = cc.Close()
+		}
 		resp.Status = relay.StatusNetworkUnreachable
 		resp.WriteTo(conn)
 		return err
@@ -256,50 +245,4 @@ func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network
 	}).Infof("%s >-< %s", conn.RemoteAddr(), address)
 
 	return nil
-}
-
-// serialConn wraps a serial port connection as net.Conn.
-// Serial ports have no network addresses, so LocalAddr/RemoteAddr return
-// custom serialAddr values. Deadline methods are no-ops since serial
-// ports do not support deadlines.
-type serialConn struct {
-	io.ReadWriteCloser
-	port string
-}
-
-func (c *serialConn) LocalAddr() net.Addr {
-	return &serialAddr{
-		port: "@",
-	}
-}
-
-func (c *serialConn) RemoteAddr() net.Addr {
-	return &serialAddr{
-		port: c.port,
-	}
-}
-
-func (c *serialConn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *serialConn) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *serialConn) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-// serialAddr is the address type for a serial port connection.
-type serialAddr struct {
-	port string
-}
-
-func (a *serialAddr) Network() string {
-	return "serial"
-}
-
-func (a *serialAddr) String() string {
-	return a.port
 }
