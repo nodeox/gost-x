@@ -94,46 +94,6 @@ func TestLogTCPRecorderOption(t *testing.T) {
 	}
 }
 
-func TestRecorderRedisRecorderOption(t *testing.T) {
-	var opts redisRecorderOptions
-	RecorderRedisRecorderOption("redis-rec")(&opts)
-	if opts.recorder != "redis-rec" {
-		t.Errorf("recorder = %s, want redis-rec", opts.recorder)
-	}
-}
-
-func TestDBRedisRecorderOption(t *testing.T) {
-	var opts redisRecorderOptions
-	DBRedisRecorderOption(3)(&opts)
-	if opts.db != 3 {
-		t.Errorf("db = %d, want 3", opts.db)
-	}
-}
-
-func TestUsernameRedisRecorderOption(t *testing.T) {
-	var opts redisRecorderOptions
-	UsernameRedisRecorderOption("admin")(&opts)
-	if opts.username != "admin" {
-		t.Errorf("username = %s, want admin", opts.username)
-	}
-}
-
-func TestPasswordRedisRecorderOption(t *testing.T) {
-	var opts redisRecorderOptions
-	PasswordRedisRecorderOption("secret")(&opts)
-	if opts.password != "secret" {
-		t.Errorf("password = %s, want secret", opts.password)
-	}
-}
-
-func TestKeyRedisRecorderOption(t *testing.T) {
-	var opts redisRecorderOptions
-	KeyRedisRecorderOption("mykey")(&opts)
-	if opts.key != "mykey" {
-		t.Errorf("key = %s, want mykey", opts.key)
-	}
-}
-
 // --- FileRecorder tests ---
 
 func TestFileRecorder_Record(t *testing.T) {
@@ -842,9 +802,6 @@ func TestTCPRecorder_SatisfiesRecorder(t *testing.T) {
 }
 
 var _ io.Closer = (*fileRecorder)(nil)
-var _ io.Closer = (*redisSetRecorder)(nil)
-var _ io.Closer = (*redisListRecorder)(nil)
-var _ io.Closer = (*redisSortedSetRecorder)(nil)
 
 // --- Helper types ---
 
